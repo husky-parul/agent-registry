@@ -1,0 +1,69 @@
+%%{init: {
+  "flowchart": {
+    "htmlLabels": false,
+    "nodeSpacing": 60,
+    "rankSpacing": 60
+  },
+  "themeVariables": {
+    "fontSize": "20px"
+  }
+}}%%
+flowchart LR
+
+  %% ======================
+  %% Ingress namespace
+  %% ======================
+  subgraph Ingress["Namespace: ingress"]
+    C[Client]
+
+    EG[Envoy Gateway with auth and policy]
+
+    H[Envoy adds x principal id x agent id x tenant id headers]
+
+    S[Envoy adds trust span attributes
+trust principal id
+trust agent id
+trust tenant id
+trust target
+trust decision
+trust run id]
+
+    A[Agent or MCP server]
+    R[Downstream resource such as api or database]
+  end
+
+  %% ======================
+  %% Observability namespace
+  %% ======================
+  subgraph Observability["Namespace: observability"]
+    OC[OpenTelemetry Collector with batch and attributes processors]
+
+    P[Attributes processor ensures trust run id equals trace id]
+
+    TB[Tempo or Jaeger traces backend]
+    LB[Loki logs backend]
+    G[Grafana trust graph dashboards]
+  end
+
+  %% ============
+  %% Traffic flow
+  %% ============
+  C -->|HTTPS plus auth| EG
+  EG --> H
+  H --> S
+  S -->|Upstream call with trust headers| A
+  A -->|Call to resource| R
+
+  %% ===================
+  %% Telemetry and edges
+  %% ===================
+  S -->|OTLP traces with trust attributes| OC
+  OC --> P
+  P -->|Traces with trust attributes| TB
+  OC -->|Optional json edge logs| LB
+
+  %% ===================
+  %% Trust graph views
+  %% ===================
+  G -->|Query traces by trust run id and trust target| TB
+  G -->|Query logs for who touched what| LB

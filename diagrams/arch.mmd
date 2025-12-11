@@ -1,0 +1,41 @@
+flowchart LR
+    subgraph R["Quay (OCI Registry)"]
+        Q[(AgentCard OCI Artifacts)]
+    end
+
+    subgraph ACR["Agent Card Registry (Trust Anchor & Policy)"]
+        RC[Ingestion & Metadata Store]
+        RB[Card ↔ Workload Identity Bindings]
+        API[/REST API<br/>/agent-cards, /check-binding/]
+    end
+
+    subgraph AG["Agent Workload (Remote A2A Agent)"]
+        AW[(A2A HTTP Server)]
+        ID{{Workload Identity<br/>(SPIFFE/mTLS/Demo-ID)}}
+    end
+
+    P["Publisher / CI Pipeline"]
+    C["Client / Caller (App or Agent)"]
+
+    %% Ingestion path
+    P -- "1. Push AgentCard as OCI artifact\n(signed JSON)" --> Q
+    P -- "2. Register card_id + oci_digest\n+ allowed workload_identities" --> RC
+    RC -- "3. Optional: Pull & verify\ncard from Quay" --> Q
+    RC --> RB
+    RC --> API
+    RB --> API
+
+    %% Discovery path
+    C -- "4. Discover card\nGET /agent-cards/{card_id}" --> API
+    API -- "5. Canonical AgentCard JSON\n(including agent URL)" --> C
+
+    %% Runtime call path
+    C -- "6. Invoke agent URL\n(A2A / HTTP)" --> AW
+    AW -- "7. Present Workload Identity\n(SPIFFE/mTLS or demo header)" --> C
+
+    %% Binding check
+    C -- "8. POST /check-binding\n{card_id, workload_identity}" --> API
+    API -- "9. allow / deny\nbased on stored binding" --> C
+
+    %% Final invocation (only if allowed)
+    C -- "10. Invoke skills\n(allowed only if binding ok)" --> AW

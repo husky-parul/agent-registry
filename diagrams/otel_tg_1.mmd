@@ -1,0 +1,82 @@
+%%{init: {
+  "flowchart": {
+    "htmlLabels": false,
+    "nodeSpacing": 60,
+    "rankSpacing": 60
+  },
+  "themeVariables": {
+    "fontSize": "20px"
+  }
+}}%%
+flowchart LR
+
+  %% =======================
+  %% Ingress namespace
+  %% =======================
+  subgraph Ingress["Namespace: ingress"]
+    C[Client]
+
+    EG[Envoy Gateway
+auth and policy
+adds trust headers
+adds trust span attributes]
+
+    A[Agent or MCP server]
+    R[Downstream resource
+api or database]
+  end
+
+  %% =======================
+  %% Observability namespace
+  %% =======================
+  subgraph Observability["Namespace: observability"]
+    OC[OpenTelemetry Collector
+receives spans
+batch and attributes processors]
+
+    JB[Jaeger backend
+traces storage and query]
+
+    G[Grafana dashboards
+trust graph views]
+  end
+
+  %% =======================
+  %% Base path
+  %% =======================
+  C -->|https plus auth| EG
+  EG -->|upstream call
+trust headers applied| A
+
+  EG -->|otlp traces
+trust attributes
+trust principal id
+trust agent id
+trust target
+trust decision
+trust run id| OC
+
+  OC --> JB
+  G --> JB
+
+  %% =======================
+  %% Extended path
+  %% =======================
+  A -.->|agent emits otel span
+trust agent id
+trust target resource
+trust run id| OC
+
+  A -.->|call to resource| R
+
+  %% =======================
+  %% Styles
+  %% =======================
+  classDef base fill:#e8f3ff,stroke:#1b4f72,stroke-width:1px;
+  classDef extended fill:#fff4e5,stroke:#ef6c00,stroke-width:1px,stroke-dasharray:5 3;
+  classDef obs fill:#e9f7ef,stroke:#1e8449,stroke-width:1px;
+
+  class C,EG,A base;
+  class OC,JB,G obs;
+  class R extended;
+  class A,OC,R extended;

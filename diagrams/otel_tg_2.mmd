@@ -1,0 +1,105 @@
+%%{init: {
+  "flowchart": {
+    "htmlLabels": false,
+    "nodeSpacing": 60,
+    "rankSpacing": 60
+  },
+  "themeVariables": {
+    "fontSize": "20px"
+  }
+}}%%
+flowchart LR
+
+  %% =======================
+  %% Ingress gateway
+  %% =======================
+  subgraph IngressNS["Namespace: ingress-gateway"]
+    C[Client]
+
+    IG[Envoy ingress gateway
+auth and policy
+adds trust headers
+adds trust span attributes]
+  end
+
+  %% =======================
+  %% Workloads and resources
+  %% =======================
+  subgraph WorkloadsNS["Namespace: workloads"]
+    A[Agent or MCP server]
+    R[Resource service
+api or database]
+  end
+
+  %% =======================
+  %% Egress gateway
+  %% =======================
+  subgraph EgressNS["Namespace: egress-gateway"]
+    EG[Envoy egress gateway
+fronts resources
+adds trust span attributes]
+  end
+
+  %% =======================
+  %% Observability
+  %% =======================
+  subgraph ObsNS["Namespace: observability"]
+    OC[OpenTelemetry Collector
+otlp receiver
+batch and attributes processors]
+
+    JB[Jaeger backend
+traces storage and query]
+
+    G[Grafana dashboards
+trust graph views]
+  end
+
+  %% ===========
+  %% Principal -> Agent hops (solid)
+  %% ===========
+  C -->|principal to agent hop
+https request with authentication| IG
+  IG -->|principal to agent hop
+upstream call
+trust headers applied| A
+
+  IG -->|otlp traces
+trust principal id
+trust agent id
+trust target agent
+trust decision
+trust run id| OC
+
+  %% ====================
+  %% Agent -> Resource hops (dashed)
+  %% ====================
+  A -.->|agent to resource hop
+http or grpc call
+using egress gateway| EG
+  EG -.->|agent to resource hop
+call to resource
+propagate trace context
+and trust headers| R
+
+  EG -.->|otlp traces
+trust agent id
+trust target resource
+trust run id| OC
+
+  %% ===========
+  %% Observability
+  %% ===========
+  OC --> JB
+  G --> JB
+
+  %% ====================
+  %% Styles
+  %% ====================
+  classDef base fill:#e8f3ff,stroke:#1b4f72,stroke-width:1px;
+  classDef extended fill:#fff4e5,stroke:#ef6c00,stroke-width:1px,stroke-dasharray:5 3;
+  classDef obs fill:#e9f7ef,stroke:#1e8449,stroke-width:1px;
+
+  class C,IG,A base;
+  class EG,R extended;
+  class OC,JB,G obs;
