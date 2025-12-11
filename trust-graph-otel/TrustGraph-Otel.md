@@ -151,32 +151,47 @@ trust run id| OC
 
     All spans carry the following:
 
-    | Attribute Meaning  |
-    |                    |
-    | `trust.run_id`       | Stable trust lineage ID (same as trace_id unless overridden) |
-    | `trust.principal_id` | End-user, system, or identity that initiated the request     |
-    | `trust.agent_id`     | Logical agent or MCP server handling the hop                 |
-    | `trust.tenant_id`    | (Optional) Multi-tenancy isolation                           |
-    | `trust.target`       | Upstream target (agent or resource)                          |
-    | `trust.decision`     | allow / deny from the gateway                                |
+    | Attribute             | Meaning                    |
+    | --------------------- | -------------------------- |
+    | `trust.run_id`        | Stable trust lineage ID    |
+    | `trust.principal_id`  | End-user, system, or identity that initiated the request    |
+    | `trust.agent_id`      | Logical agent or MCP server handling the hop     |
+    | `trust.target`        | Upstream target (agent or resource)    |
+    | `trust.decision`      | Allow / deny from the gateway    |
+
 
 6. Ingress Envoy Responsibilities
 
     - Authenticate request
     - Authorize request
     - Normalize identity → trust headers
-    - Add trust.* span attributes
+    - Add `trust.*` span attributes
     - Export spans via OTLP to Collector
 
 7. Egress Envoy Responsibilities
 
     - Capture agent outbound calls
     - Forward trust headers and trace context
-    - Add trust.* span attributes for resource access
+    - Add `trust.*` span attributes for resource access
     - Export spans
 
 8. OTel Collector Responsibilities
 
     - Receive OTLP traces from both Envoys
-    - Ensure trust.run_id = trace_id (attributes processor)
+    - Ensure `trust.run_id` = `trace_id` (attributes processor)
     - Batch, normalize, export to Jaeger
+
+## How is Trust Graph lineage established?
+
+```mermaid
+flowchart TD
+    A["Ingress Envoy begins a trace with trust context"]
+    B["Agents receive trace context via OTel propagation"]
+    C["Each agent updates its caller identity x-agent-id"]
+    D["Egress Envoy emits a span for each hop"]
+    E["OTel Collector normalizes trust.run_id to trace_id"]
+    F["Jaeger stores all spans under the same trace"]
+    G["Every hop is linked together"]
+
+    A --> B --> C --> D --> E --> F --> G
+```
