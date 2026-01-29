@@ -1,14 +1,23 @@
 apiVersion: v1
 kind: Namespace
 metadata:
-  name: observability
+  name: ingress-gateway
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: egress-gateway
 ---
 apiVersion: v1
 kind: Namespace
 metadata:
   name: workloads
 ---
-# JAEGER: UI and OTLP Ingestion
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: observability
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -26,10 +35,10 @@ spec:
     spec:
       containers:
         - name: jaeger
-          image: jaegertracing/all-in-one:1.59 # 2025 latest stable
+          image: jaegertracing/all-in-one:1.57
           ports:
-            - containerPort: 16686 # UI
-            - containerPort: 4317  # OTLP gRPC
+            - containerPort: 16686  # UI
+            - containerPort: 4317   # OTLP gRPC
           env:
             - name: COLLECTOR_OTLP_ENABLED
               value: "true"
@@ -47,10 +56,12 @@ spec:
   ports:
     - name: http-ui
       port: 16686
+      targetPort: 16686
     - name: otlp-grpc
       port: 4317
+      targetPort: 4317
+
 ---
-# OTEL COLLECTOR: The bridge between app and Jaeger
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -62,24 +73,28 @@ data:
       otlp:
         protocols:
           grpc:
-            endpoint: 0.0.0.0:4317
           http:
-            endpoint: 0.0.0.0:4318
+
     processors:
       batch: {}
+      attributes:
+        actions:
+          - key: trust.run_id
+            action: insert
+            from_attribute: trace_id
+
     exporters:
-      debug:
-        verbosity: detailed
       otlp:
         endpoint: jaeger.observability.svc.cluster.local:4317
         tls:
           insecure: true
+
     service:
       pipelines:
         traces:
           receivers: [otlp]
-          processors: [batch]
-          exporters: [otlp, debug]
+          processors: [batch, attributes]
+          exporters: [otlp]
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -98,12 +113,12 @@ spec:
     spec:
       containers:
         - name: otel-collector
-          # 2025 Latest Stable Version
-          image: otel/opentelemetry-collector-contrib:0.141.0 
-          args: ["--config=/etc/otel/otel-collector-config.yaml"]
+          image: otel/opentelemetry-collector-contrib:0.102.0
+          args:
+            - "--config=/etc/otel/otel-collector-config.yaml"
           ports:
-            - containerPort: 4317
-            - containerPort: 4318
+            - containerPort: 4317 # OTLP gRPC
+            - containerPort: 4318 # OTLP HTTP
           volumeMounts:
             - name: otel-config
               mountPath: /etc/otel
@@ -111,7 +126,6 @@ spec:
         - name: otel-config
           configMap:
             name: otel-collector-config
-
 ---
 apiVersion: v1
 kind: Service
@@ -124,10 +138,12 @@ spec:
   ports:
     - name: otlp-grpc
       port: 4317
+      targetPort: 4317
     - name: otlp-http
       port: 4318
+      targetPort: 4318
 ---
-# WORKLOAD: A sample application generating traces
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -147,38 +163,10 @@ spec:
         - name: agent
           image: hashicorp/http-echo:0.2.3
           args:
-            - "-text=Hello from agent"
+            - "-text=hello from agent"
             - "-listen=:8080"
           ports:
             - containerPort: 8080
-# apiVersion: apps/v1
-# kind: Deployment
-# metadata:
-#   name: agent
-#   namespace: workloads
-# spec:
-#   replicas: 1
-#   selector:
-#     matchLabels:
-#       app: agent
-#   template:
-#     metadata:
-#       labels:
-#         app: agent
-#     spec:
-#       containers:
-#         - name: agent
-#           image: ghcr.io/krzko/otelgen:latest
-#           args:
-#             - "--otel-exporter-otlp-endpoint"
-#             - "otel-collector.observability.svc.cluster.local:4317"
-#             - "--insecure"
-#             - "--service-name"
-#             - "agent-test-generator"
-#             - "--rate"
-#             - "5"
-#             - "traces" # Command comes last
-#             - "multi"   # Sub-command
 ---
 apiVersion: v1
 kind: Service
@@ -189,5 +177,6 @@ spec:
   selector:
     app: agent
   ports:
-    - name: grpc
+    - name: http
       port: 8080
+      targetPort: 8080
