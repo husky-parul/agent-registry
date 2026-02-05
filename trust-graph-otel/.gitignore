@@ -1,0 +1,31 @@
+# Kubernetes
+*.kubeconfig
+kubeconfig
+.claude
+
+# Kind
+kind-config.yaml.local
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Secrets (never commit)
+**/secrets/
+*.secret
+*.key
+*.pem
+
+# Local overrides
+*.local.yaml
+*.local.yml
+
+# Logs
+*.log
+logs/
