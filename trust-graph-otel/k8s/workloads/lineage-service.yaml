@@ -10,8 +10,97 @@ data:
     import urllib.request
     import urllib.parse
     import os
+    import sqlite3
+    import hashlib
+    import time
 
     JAEGER_URL = os.environ.get("JAEGER_URL", "http://jaeger.observability.svc.cluster.local:16686")
+    DB_PATH = os.environ.get("DB_PATH", "/data/lineage.db")
+
+    def init_db():
+        """Initialize SQLite database with schema. Safe to call multiple times."""
+        conn = sqlite3.connect(DB_PATH)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA foreign_keys=ON")
+        c = conn.cursor()
+
+        c.execute("""CREATE TABLE IF NOT EXISTS runs (
+            run_id          TEXT PRIMARY KEY,
+            principal_id    TEXT,
+            started_at      INTEGER,
+            ended_at        INTEGER,
+            ingested_at     INTEGER,
+            sealed          INTEGER DEFAULT 1,
+            schema_version  INTEGER DEFAULT 1,
+            content_hash    TEXT,
+            node_count      INTEGER,
+            edge_count      INTEGER,
+            resource_count  INTEGER
+        )""")
+
+        c.execute("""CREATE TABLE IF NOT EXISTS nodes (
+            run_id   TEXT,
+            node_id  TEXT,
+            type     TEXT,
+            label    TEXT,
+            PRIMARY KEY(run_id, node_id)
+        )""")
+
+        c.execute("""CREATE TABLE IF NOT EXISTS edges (
+            run_id            TEXT,
+            source            TEXT,
+            target            TEXT,
+            hop_kind          TEXT,
+            logical_count     INTEGER,
+            raw_count         INTEGER,
+            first_ts          INTEGER,
+            last_ts           INTEGER,
+            total_duration_us INTEGER,
+            PRIMARY KEY(run_id, source, target, hop_kind)
+        )""")
+
+        c.execute("""CREATE TABLE IF NOT EXISTS edge_spans (
+            run_id   TEXT,
+            source   TEXT,
+            target   TEXT,
+            hop_kind TEXT,
+            span_id  TEXT,
+            PRIMARY KEY(run_id, source, target, hop_kind, span_id)
+        )""")
+
+        c.execute("""CREATE TABLE IF NOT EXISTS paths (
+            run_id      TEXT,
+            target_node TEXT,
+            full_path   TEXT,
+            accessor    TEXT,
+            hop_kind    TEXT,
+            span_count  INTEGER,
+            PRIMARY KEY(run_id, full_path)
+        )""")
+
+        c.execute("""CREATE TABLE IF NOT EXISTS agent_cards (
+            agent_id        TEXT PRIMARY KEY,
+            name            TEXT,
+            version         TEXT,
+            capabilities    TEXT,
+            endpoints       TEXT,
+            dependencies    TEXT,
+            trust_metadata  TEXT,
+            registered_at   INTEGER,
+            source          TEXT
+        )""")
+
+        conn.commit()
+        conn.close()
+        print(f"[lineage-service] SQLite initialized at {DB_PATH}")
+
+    def get_db():
+        """Get a SQLite connection."""
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA foreign_keys=ON")
+        return conn
 
     class LineageService(BaseHTTPRequestHandler):
         def do_GET(self):
@@ -22,6 +111,13 @@ data:
 
             if path_parts == ["lineage", "all"]:
                 self.handle_all_traces(output_format)
+            elif len(path_parts) == 3 and path_parts[0] == "lineage" and path_parts[2] == "explain":
+                run_id = urllib.parse.unquote(path_parts[1])
+                node = query_params.get("node", [None])[0]
+                self.handle_explain(run_id, node, output_format)
+            elif len(path_parts) == 3 and path_parts[0] == "lineage" and path_parts[2] == "dag":
+                run_id = urllib.parse.unquote(path_parts[1])
+                self.handle_dag(run_id, output_format)
             elif len(path_parts) == 3 and path_parts[0] == "lineage" and path_parts[2] == "trust":
                 run_id = urllib.parse.unquote(path_parts[1])
                 self.handle_trust_lineage(run_id, output_format)
@@ -31,7 +127,7 @@ data:
             elif parsed.path == "/health":
                 self.send_json({"status": "ok"})
             else:
-                self.send_json({"error": "Use /lineage/all, /lineage/{run_id} (debug), or /lineage/{run_id}/trust (clean)"}, 400)
+                self.send_json({"error": "Endpoints: /lineage/all, /lineage/{run_id}, /lineage/{run_id}/trust, /lineage/{run_id}/dag, /lineage/{run_id}/explain?node=..."}, 400)
 
         def handle_all_traces(self, output_format):
             """List all available trace IDs from Jaeger (envoy-ingress only)."""
@@ -143,24 +239,44 @@ data:
             except Exception as e:
                 self.send_json({"error": str(e)}, 500)
 
-        def build_trust_lineage(self, trace_data, run_id):
-            """Build deduplicated trust lineage - one hop per unique source->target pair."""
+        def handle_dag(self, run_id, output_format):
+            """Handle /lineage/{run_id}/dag - Trust DAG representation."""
+            try:
+                tags_json = json.dumps({"trust.run_id": run_id})
+                encoded_tags = urllib.parse.quote(tags_json)
+                search_url = f"{JAEGER_URL}/api/traces?service=envoy-ingress&tags={encoded_tags}&limit=100"
+                req = urllib.request.Request(search_url)
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    trace_data = json.loads(resp.read().decode())
+
+                dag = self.build_dag(trace_data, run_id)
+
+                if output_format == "dot":
+                    self.send_text(self.format_dag_dot(dag), 200)
+                else:
+                    self.send_json(dag)
+
+            except urllib.error.HTTPError as e:
+                self.send_json({"error": f"Jaeger error: {e.code}"}, 500)
+            except Exception as e:
+                self.send_json({"error": str(e)}, 500)
+
+        def build_dag(self, trace_data, run_id):
+            """Build Trust DAG with nodes and edges from trace data."""
             if not trace_data.get("data") or len(trace_data["data"]) == 0:
                 return {"error": f"No traces found for run_id: {run_id}"}
 
             # Collect all spans
             all_spans = []
-            all_processes = {}
             for trace in trace_data["data"]:
                 spans = trace.get("spans", [])
-                processes = trace.get("processes", {})
-                all_processes.update(processes)
                 for span in spans:
                     all_spans.append(span)
 
-            # Extract trust hops and deduplicate by (source, target) pair
-            # Prefer "inbound" operations over "outbound" for cleaner view
-            hop_map = {}  # key: (source, target) -> hop data
+            # Build nodes and edges
+            nodes = {}  # id -> node data
+            edges = {}  # (source, target) -> edge data
+
             for span in all_spans:
                 tags = {t["key"]: t["value"] for t in span.get("tags", [])}
                 trust_tags = {k: v for k, v in tags.items() if k.startswith("trust.")}
@@ -171,76 +287,593 @@ data:
                 source = trust_tags.get("trust.source", "unknown")
                 target = trust_tags.get("trust.target", "unknown")
                 hop_kind = trust_tags.get("trust.hop_kind", "unknown")
-                operation = span["operationName"]
+                span_id = span.get("spanID", "")
 
-                # Skip if target is unknown (outbound spans sometimes lack target)
+                # Skip unknown targets
                 if target == "unknown":
                     continue
 
-                hop_key = (source, target)
+                # Add source node
+                if source not in nodes:
+                    nodes[source] = {
+                        "id": source,
+                        "type": self.get_node_type(source),
+                        "label": source.split(":")[-1] if ":" in source else source,
+                    }
 
-                # Prefer inbound spans (they have accurate target info)
-                is_inbound = operation.startswith("inbound:")
-                existing = hop_map.get(hop_key)
+                # Add target node
+                if target not in nodes:
+                    nodes[target] = {
+                        "id": target,
+                        "type": self.get_node_type(target),
+                        "label": target.split(":")[-1] if ":" in target else target,
+                    }
 
-                if existing is None or (is_inbound and not existing.get("_is_inbound")):
-                    hop_map[hop_key] = {
+                # Add or update edge
+                edge_key = (source, target)
+                start_time = span.get("startTime", 0)
+                duration = span.get("duration", 0)
+                if edge_key not in edges:
+                    edges[edge_key] = {
                         "source": source,
                         "target": target,
                         "hop_kind": hop_kind,
-                        "operation": operation,
-                        "start_time": span["startTime"],
-                        "duration_us": span["duration"],
-                        "_is_inbound": is_inbound,
+                        "count": 0,
+                        "span_ids": [],
+                        "first_ts": start_time,
+                        "last_ts": start_time,
+                        "total_duration_us": 0,
                     }
+                edges[edge_key]["count"] += 1
+                edges[edge_key]["first_ts"] = min(edges[edge_key]["first_ts"], start_time)
+                edges[edge_key]["last_ts"] = max(edges[edge_key]["last_ts"], start_time)
+                edges[edge_key]["total_duration_us"] += duration
+                if span_id and span_id not in edges[edge_key]["span_ids"]:
+                    edges[edge_key]["span_ids"].append(span_id)
 
-            # Convert to list and sort by start time
-            hops = list(hop_map.values())
-            hops.sort(key=lambda h: h["start_time"])
+            # Compute logical_count (unique spans) for each edge
+            for edge in edges.values():
+                edge["logical_count"] = len(edge["span_ids"])
+
+            # Find principal (entry point)
+            principal = None
+            for node_id, node in nodes.items():
+                if node["type"] == "principal":
+                    principal = node_id
+                    break
 
             # Build result
+            dag = {
+                "run_id": run_id,
+                "principal": principal,
+                "nodes": list(nodes.values()),
+                "edges": list(edges.values()),
+                "field_descriptions": {
+                    "count": "Total raw span observations for this edge (includes duplicate spans from ingress + sidecar)",
+                    "logical_count": "Number of unique span IDs observed for this edge (deduplicated)",
+                    "span_ids": "List of unique span IDs that contributed to this edge",
+                    "first_ts": "Timestamp (microseconds) of the earliest span on this edge",
+                    "last_ts": "Timestamp (microseconds) of the latest span on this edge",
+                    "total_duration_us": "Sum of all span durations on this edge (microseconds)",
+                },
+                "summary": {
+                    "total_nodes": len(nodes),
+                    "total_edges": len(edges),
+                    "principals": len([n for n in nodes.values() if n["type"] == "principal"]),
+                    "agents": len([n for n in nodes.values() if n["type"] == "agent"]),
+                    "resources": len([n for n in nodes.values() if n["type"] == "resource"]),
+                }
+            }
+
+            return dag
+
+        def get_node_type(self, node_id):
+            """Determine node type from ID prefix."""
+            if node_id.startswith("user:") or node_id.startswith("principal:"):
+                return "principal"
+            elif node_id.startswith("agent:"):
+                return "agent"
+            elif node_id.startswith("resource:"):
+                return "resource"
+            return "unknown"
+
+        def format_dag_dot(self, dag):
+            """Format DAG as DOT/Graphviz."""
+            if "error" in dag:
+                return f"// Error: {dag['error']}"
+
+            lines = [
+                f'digraph TrustGraph {{',
+                f'  label="Trust DAG: {dag["run_id"]}"',
+                f'  labelloc="t"',
+                f'  rankdir="LR"',
+                f'  node [shape=box, style=filled]',
+                f'',
+                f'  // Node styles by type',
+                f'  node [fillcolor="#E8F5E9"] // default',
+                f'',
+            ]
+
+            # Add nodes with styling
+            for node in dag["nodes"]:
+                node_id = node["id"].replace(":", "_").replace("-", "_")
+                label = node["label"]
+                if node["type"] == "principal":
+                    style = 'fillcolor="#BBDEFB", shape=ellipse'
+                elif node["type"] == "agent":
+                    style = 'fillcolor="#C8E6C9", shape=box'
+                elif node["type"] == "resource":
+                    style = 'fillcolor="#FFE0B2", shape=cylinder'
+                else:
+                    style = 'fillcolor="#F5F5F5"'
+                lines.append(f'  {node_id} [label="{label}", {style}]')
+
+            lines.append('')
+            lines.append('  // Edges')
+
+            # Add edges
+            for edge in dag["edges"]:
+                src = edge["source"].replace(":", "_").replace("-", "_")
+                tgt = edge["target"].replace(":", "_").replace("-", "_")
+                label = edge["hop_kind"].replace("_", "\\n")
+                lc = edge.get("logical_count", edge["count"])
+                if lc > 1:
+                    label += f"\\n(x{lc})"
+                lines.append(f'  {src} -> {tgt} [label="{label}"]')
+
+            lines.append('}')
+            return '\n'.join(lines)
+
+        def handle_explain(self, run_id, node, output_format):
+            """Handle /lineage/{run_id}/explain?node=... - Explain why a node was accessed."""
+            if not node:
+                self.send_json({"error": "Missing 'node' parameter. Example: ?node=resource:mock-database"}, 400)
+                return
+
+            try:
+                tags_json = json.dumps({"trust.run_id": run_id})
+                encoded_tags = urllib.parse.quote(tags_json)
+                search_url = f"{JAEGER_URL}/api/traces?service=envoy-ingress&tags={encoded_tags}&limit=100"
+                req = urllib.request.Request(search_url)
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    trace_data = json.loads(resp.read().decode())
+
+                if not trace_data.get("data"):
+                    self.send_json({"error": f"No traces found for run_id: {run_id}"}, 404)
+                    return
+
+                explanation = self.build_explanation(trace_data, run_id, node)
+
+                if output_format == "text":
+                    self.send_text(self.format_explanation_text(explanation))
+                else:
+                    self.send_json(explanation)
+
+            except urllib.error.HTTPError as e:
+                self.send_json({"error": f"Jaeger error: {e.code}"}, 500)
+            except Exception as e:
+                self.send_json({"error": str(e)}, 500)
+
+        def get_trust_spans(self, trace_data):
+            """Extract all trust-tagged spans from trace data, sorted by start_time."""
+            spans = []
+            for trace in trace_data.get("data", []):
+                for span in trace.get("spans", []):
+                    tags = {t["key"]: t["value"] for t in span.get("tags", [])}
+                    trust_tags = {k: v for k, v in tags.items() if k.startswith("trust.")}
+                    src = trust_tags.get("trust.source")
+                    tgt = trust_tags.get("trust.target")
+                    if src and tgt and tgt != "unknown":
+                        spans.append({
+                            "span_id": span.get("spanID", ""),
+                            "trust": trust_tags,
+                            "start_time": span.get("startTime", 0),
+                            "duration": span.get("duration", 0),
+                            "operation": span.get("operationName", ""),
+                        })
+            spans.sort(key=lambda s: s["start_time"])
+            return spans
+
+        def reconstruct_causal_chain(self, trust_spans, target_span):
+            """Reconstruct the causal chain for a span using temporal backtracking.
+
+            Since Envoy sidecars create independent traces (no parent-child refs
+            across services), we trace causality by finding the most recent inbound
+            span that 'called' each actor in the chain.
+
+            Returns list of hops from root to target.
+            """
+            chain = [{
+                "source": target_span["trust"]["trust.source"],
+                "target": target_span["trust"]["trust.target"],
+                "hop_kind": target_span["trust"].get("trust.hop_kind", "unknown"),
+                "start_time": target_span["start_time"],
+                "duration": target_span["duration"],
+                "span_id": target_span["span_id"],
+            }]
+
+            current_actor = target_span["trust"]["trust.source"]
+            current_ts = target_span["start_time"]
+            visited = {target_span["trust"]["trust.target"]}
+            max_depth = 10
+
+            while self.get_node_type(current_actor) != "principal" and current_actor not in visited and max_depth > 0:
+                visited.add(current_actor)
+                max_depth -= 1
+
+                # Find most recent inbound span with target=current_actor before current_ts
+                parent_span = None
+                for s in reversed(trust_spans):
+                    if s["start_time"] >= current_ts:
+                        continue
+                    if s["trust"].get("trust.target") == current_actor:
+                        if s["operation"].startswith("inbound:"):
+                            parent_span = s
+                            break
+                        elif parent_span is None:
+                            parent_span = s
+
+                if parent_span:
+                    chain.append({
+                        "source": parent_span["trust"]["trust.source"],
+                        "target": current_actor,
+                        "hop_kind": parent_span["trust"].get("trust.hop_kind", "unknown"),
+                        "start_time": parent_span["start_time"],
+                        "duration": parent_span["duration"],
+                        "span_id": parent_span["span_id"],
+                    })
+                    current_actor = parent_span["trust"]["trust.source"]
+                    current_ts = parent_span["start_time"]
+                else:
+                    break
+
+            chain.reverse()
+            return chain
+
+        def build_explanation(self, trace_data, run_id, target_node):
+            """Build explanation with per-span temporal chain tracking."""
+            trust_spans = self.get_trust_spans(trace_data)
+
+            # Find all spans targeting the requested node
+            target_spans = [s for s in trust_spans if s["trust"].get("trust.target") == target_node]
+
+            if not target_spans:
+                all_nodes = set()
+                for span in trust_spans:
+                    all_nodes.add(span["trust"].get("trust.source"))
+                    all_nodes.add(span["trust"].get("trust.target"))
+                return {"error": f"Node '{target_node}' not found as a target", "available_nodes": sorted(list(all_nodes))}
+
+            # For each target span, reconstruct causal chain via temporal backtracking
+            cause_map = {}
+            for target_span in target_spans:
+                chain = self.reconstruct_causal_chain(trust_spans, target_span)
+
+                # Build path from chain
+                path = []
+                for hop in chain:
+                    if not path or path[-1] != hop["source"]:
+                        path.append(hop["source"])
+                if chain:
+                    last_tgt = chain[-1]["target"]
+                    if not path or path[-1] != last_tgt:
+                        path.append(last_tgt)
+
+                if len(path) < 2:
+                    continue
+
+                path_key = tuple(path)
+                accessor = path[-2]
+
+                if path_key in cause_map:
+                    cause_map[path_key]["span_count"] += 1
+                    cause_map[path_key]["span_ids"].append(target_span["span_id"])
+                    cause_map[path_key]["last_ts"] = max(cause_map[path_key]["last_ts"], target_span["start_time"])
+                    cause_map[path_key]["total_duration_us"] += target_span["duration"]
+                else:
+                    delegation = []
+                    for i in range(len(chain) - 1, 0, -1):
+                        delegation.append({
+                            "actor": chain[i - 1]["source"],
+                            "hop_kind": chain[i - 1]["hop_kind"],
+                            "first_ts": chain[i - 1]["start_time"],
+                        })
+
+                    cause_map[path_key] = {
+                        "accessor": accessor,
+                        "hop_kind": chain[-1]["hop_kind"] if chain else "unknown",
+                        "span_count": 1,
+                        "span_ids": [target_span["span_id"]],
+                        "first_ts": target_span["start_time"],
+                        "last_ts": target_span["start_time"],
+                        "total_duration_us": target_span["duration"],
+                        "full_path": list(path),
+                        "delegated_by": delegation,
+                    }
+
+            cause_groups = list(cause_map.values())
+            cause_groups.sort(key=lambda c: c["first_ts"])
+
+            # Detect parallel execution with cause indices
+            parallel_groups = self.detect_parallel_execution(cause_groups)
+
+            direct_accessors = list(set(c["accessor"] for c in cause_groups))
+
+            # Find principal
+            principal = "unknown"
+            for span in trust_spans:
+                src = span["trust"].get("trust.source", "")
+                if self.get_node_type(src) == "principal":
+                    principal = src
+                    break
+
+            explanation = {
+                "question": f"Why was {target_node} accessed?",
+                "target": target_node,
+                "target_type": self.get_node_type(target_node),
+                "run_id": run_id,
+                "principal": principal,
+                "direct_accessors": direct_accessors,
+                "cause_groups": cause_groups,
+                "parallel_groups": parallel_groups,
+                "delegation_order": "closest-first (immediate caller first, principal last)",
+                "field_descriptions": {
+                    "span_count": "Number of individual spans attributed to this specific path (per-span tracking)",
+                    "span_ids": "Actual span IDs for the access events on this path",
+                    "total_duration_us": "Sum of span durations attributed to this path (microseconds)",
+                },
+                "answer": self.generate_answer(target_node, principal, cause_groups, parallel_groups),
+            }
+
+            return explanation
+
+        def detect_parallel_execution(self, cause_groups):
+            """Detect which cause groups executed in parallel (overlapping timestamps)."""
+            if len(cause_groups) < 2:
+                return []
+
+            parallel_groups = []
+            used = set()
+
+            for i, c1 in enumerate(cause_groups):
+                if i in used:
+                    continue
+                group_indices = [i]
+
+                for j, c2 in enumerate(cause_groups):
+                    if i >= j or j in used:
+                        continue
+                    window = 100000  # 100ms in microseconds
+                    if abs(c1["first_ts"] - c2["first_ts"]) < window:
+                        group_indices.append(j)
+                        used.add(j)
+
+                if len(group_indices) > 1:
+                    parallel_groups.append({
+                        "cause_indices": group_indices,
+                        "accessors": [cause_groups[idx]["accessor"] for idx in group_indices],
+                        "paths": [cause_groups[idx]["full_path"] for idx in group_indices],
+                    })
+                    used.add(i)
+
+            return parallel_groups
+
+        def generate_answer(self, target, principal, cause_groups, parallel_groups=None):
+            """Generate a human-readable answer with temporal context."""
+            if not cause_groups:
+                return f"No access path found to {target}"
+
+            lines = [f"{target} was accessed because:"]
+
+            # Note parallel execution if detected
+            if parallel_groups:
+                for group in parallel_groups:
+                    accessors = group.get("accessors", group) if isinstance(group, dict) else group
+                    lines.append(f"  [PARALLEL] {', '.join(accessors)} ran concurrently")
+                lines.append("")
+
+            # Group causes by accessor to show multiple paths through same accessor
+            accessor_causes = {}
+            for cause in cause_groups:
+                acc = cause["accessor"]
+                if acc not in accessor_causes:
+                    accessor_causes[acc] = []
+                accessor_causes[acc].append(cause)
+
+            cause_num = 1
+            for accessor, causes in accessor_causes.items():
+                if len(causes) == 1:
+                    cause = causes[0]
+                    path = cause.get("full_path", [])
+                    count = cause.get("span_count", 1)
+                    path_str = " -> ".join(path) if path else accessor
+                    count_str = f" ({count} span{'s' if count > 1 else ''})" if count > 1 else ""
+                    lines.append(f"  {cause_num}. {path_str}{count_str}")
+                    cause_num += 1
+                else:
+                    lines.append(f"  {cause_num}. {accessor} accessed it via {len(causes)} distinct paths:")
+                    for j, cause in enumerate(causes, 1):
+                        path = cause.get("full_path", [])
+                        count = cause.get("span_count", 1)
+                        path_str = " -> ".join(path) if path else "?"
+                        count_str = f" ({count} span{'s' if count > 1 else ''})" if count > 1 else ""
+                        lines.append(f"       {cause_num}.{j}. {path_str}{count_str}")
+                    cause_num += 1
+
+            # Add temporal ordering note
+            if len(cause_groups) > 1:
+                first_path = cause_groups[0].get("full_path", [])
+                last_path = cause_groups[-1].get("full_path", [])
+                if first_path and last_path and first_path != last_path:
+                    lines.append(f"\n  Temporal: path {' -> '.join(first_path[:3])}... started first")
+
+            return "\n".join(lines)
+
+        def format_explanation_text(self, explanation):
+            """Format explanation as human-readable text."""
+            if "error" in explanation:
+                return f"Error: {explanation['error']}\nAvailable nodes: {', '.join(explanation.get('available_nodes', []))}"
+
+            lines = [
+                "=" * 70,
+                f"PROVENANCE EXPLANATION",
+                "=" * 70,
+                f"Question: {explanation['question']}",
+                f"Run ID:   {explanation['run_id']}",
+                "",
+                f"Principal: {explanation['principal']}",
+                f"Target:    {explanation['target']} ({explanation['target_type']})",
+                "",
+                "DIRECT ACCESSORS:",
+            ]
+            for accessor in explanation["direct_accessors"]:
+                lines.append(f"  - {accessor}")
+
+            lines.append("")
+            lines.append("CAUSE GROUPS (per-span parent chain tracking):")
+            lines.append(f"(delegation order: {explanation.get('delegation_order', 'closest-first')})")
+            lines.append("-" * 70)
+
+            for i, cause in enumerate(explanation.get("cause_groups", []), 1):
+                accessor = cause["accessor"]
+                path = cause.get("full_path", [])
+                span_count = cause.get("span_count", 0)
+                duration = cause.get("total_duration_us", 0)
+                lines.append(f"  Cause {i}: {' -> '.join(path)}")
+                lines.append(f"           accessor={accessor}, spans={span_count}, duration={duration}us")
+                delegation = cause.get("delegated_by", [])
+                if delegation:
+                    del_str = " <- ".join([d["actor"] for d in delegation])
+                    lines.append(f"           delegated_by (closest-first): {del_str}")
+
+            # Show parallel groups if any
+            parallel = explanation.get("parallel_groups", [])
+            if parallel:
+                lines.append("")
+                lines.append("PARALLEL EXECUTION DETECTED:")
+                for group in parallel:
+                    accessors = group.get("accessors", []) if isinstance(group, dict) else group
+                    indices = group.get("cause_indices", []) if isinstance(group, dict) else []
+                    lines.append(f"  - Causes {', '.join(str(i+1) for i in indices)}: {', '.join(accessors)} ran concurrently")
+
+            lines.append("")
+            lines.append("ANSWER:")
+            lines.append("-" * 70)
+            lines.append(explanation["answer"])
+            lines.append("")
+            lines.append("=" * 70)
+
+            return "\n".join(lines)
+
+        def build_trust_lineage(self, trace_data, run_id):
+            """Build topologically ordered event list - all causal hops including
+            duplicates from different delegation paths.
+
+            Uses temporal backtracking to reconstruct causal chains since Envoy
+            sidecars create independent traces without parent-child references."""
+            if not trace_data.get("data") or len(trace_data["data"]) == 0:
+                return {"error": f"No traces found for run_id: {run_id}"}
+
+            trust_spans = self.get_trust_spans(trace_data)
+
+            # Find leaf spans (resource accesses) - these are the endpoints of each chain
+            resource_spans = [s for s in trust_spans if self.get_node_type(s["trust"]["trust.target"]) == "resource"]
+
+            # Also find terminal agent-to-agent spans (agents that don't call downstream)
+            # by finding agent targets that never appear as a source
+            all_sources = {s["trust"]["trust.source"] for s in trust_spans}
+            all_targets = {s["trust"]["trust.target"] for s in trust_spans}
+            terminal_agents = all_targets - all_sources
+            terminal_spans = [s for s in trust_spans
+                              if s["trust"]["trust.target"] in terminal_agents
+                              and s["operation"].startswith("inbound:")]
+
+            leaf_spans = resource_spans + terminal_spans
+
+            # Reconstruct causal chains for each leaf span
+            all_chains = []
+            for leaf in leaf_spans:
+                chain = self.reconstruct_causal_chain(trust_spans, leaf)
+                all_chains.append(chain)
+
+            # Collect all unique events: each hop in each chain, keyed by causal context
+            seen_events = set()
+            events = []
+
+            for chain in all_chains:
+                path_so_far = []
+                for hop in chain:
+                    if not path_so_far or path_so_far[-1] != hop["source"]:
+                        path_so_far.append(hop["source"])
+                    causal_path = path_so_far + [hop["target"]]
+
+                    event_key = (hop["source"], hop["target"], tuple(causal_path))
+                    if event_key in seen_events:
+                        continue
+                    seen_events.add(event_key)
+
+                    events.append({
+                        "source": hop["source"],
+                        "target": hop["target"],
+                        "hop_kind": hop["hop_kind"],
+                        "start_time": hop["start_time"],
+                        "span_duration_us": hop["duration"],
+                        "causal_path": list(causal_path),
+                        "span_id": hop["span_id"],
+                    })
+
+            # Sort by start_time (topological approximation)
+            events.sort(key=lambda e: e["start_time"])
+
+            # Collect agents and resources
             agents = set()
             resources = set()
-            for hop in hops:
-                if hop["target"].startswith("agent:"):
-                    agents.add(hop["target"])
-                elif hop["target"].startswith("resource:"):
-                    resources.add(hop["target"])
-                if hop["source"].startswith("agent:"):
-                    agents.add(hop["source"])
+            for event in events:
+                for actor in [event["source"], event["target"]]:
+                    if actor.startswith("agent:"):
+                        agents.add(actor)
+                    elif actor.startswith("resource:"):
+                        resources.add(actor)
 
             lineage = {
                 "run_id": run_id,
-                "principal": hops[0]["source"] if hops else "unknown",
-                "total_hops": len(hops),
+                "type": "topologically_ordered_event_list",
+                "description": "All causal hops in temporal order. Duplicate edges from different delegation paths appear separately.",
+                "principal": events[0]["source"] if events else "unknown",
+                "total_events": len(events),
                 "agents_involved": sorted(list(agents)),
                 "resources_accessed": sorted(list(resources)),
+                "field_descriptions": {
+                    "span_duration_us": "Duration of this individual span (not aggregated)",
+                    "causal_path": "Full delegation chain from principal to this hop's target",
+                },
                 "trust_chain": [],
             }
 
-            for i, hop in enumerate(hops):
+            for i, event in enumerate(events):
                 lineage["trust_chain"].append({
                     "step": i + 1,
-                    "hop_kind": hop["hop_kind"],
-                    "source": hop["source"],
-                    "target": hop["target"],
-                    "duration_us": hop["duration_us"],
+                    "hop_kind": event["hop_kind"],
+                    "source": event["source"],
+                    "target": event["target"],
+                    "span_duration_us": event["span_duration_us"],
+                    "causal_path": event["causal_path"],
                 })
 
             return lineage
 
         def format_trust_lineage_text(self, lineage):
-            """Format deduplicated trust lineage as text."""
+            """Format trust lineage as text (topologically ordered event list)."""
             if "error" in lineage:
                 return f"Error: {lineage['error']}"
 
             lines = [
                 "=" * 60,
-                "TRUST GRAPH (deduplicated)",
+                "TRUST GRAPH (topologically ordered events)",
                 "=" * 60,
-                f"Run ID:    {lineage['run_id']}",
-                f"Principal: {lineage['principal']}",
-                f"Total Hops: {lineage['total_hops']}",
+                f"Run ID:     {lineage['run_id']}",
+                f"Principal:  {lineage['principal']}",
+                f"Total Events: {lineage.get('total_events', len(lineage.get('trust_chain', [])))}",
                 "",
                 "AGENTS INVOLVED:",
             ]
@@ -253,11 +886,14 @@ data:
                 lines.append(f"  - {resource}")
 
             lines.append("")
-            lines.append("TRUST CHAIN:")
+            lines.append("TRUST CHAIN (all causal hops, temporal order):")
             lines.append("-" * 60)
 
             for step in lineage["trust_chain"]:
-                lines.append(f"{step['step']}. [{step['hop_kind']}] {step['source']} -> {step['target']}")
+                path = step.get("causal_path", [])
+                path_str = f"  via: {' -> '.join(path)}" if len(path) > 2 else ""
+                duration = step.get("span_duration_us", step.get("duration_us", 0))
+                lines.append(f"{step['step']}. [{step['hop_kind']}] {step['source']} -> {step['target']} ({duration}us){path_str}")
 
             lines.append("")
             lines.append("=" * 60)
@@ -405,6 +1041,7 @@ data:
             self.wfile.write(text.encode())
 
     if __name__ == "__main__":
+        init_db()
         print("[lineage-service] Starting on port 8080...")
         HTTPServer(("0.0.0.0", 8080), LineageService).serve_forever()
 ---
@@ -432,13 +1069,20 @@ spec:
           env:
             - name: JAEGER_URL
               value: "http://jaeger.observability.svc.cluster.local:16686"
+            - name: DB_PATH
+              value: "/data/lineage.db"
           volumeMounts:
             - name: config
               mountPath: /app
+            - name: data
+              mountPath: /data
       volumes:
         - name: config
           configMap:
             name: lineage-service-config
+        - name: data
+          persistentVolumeClaim:
+            claimName: lineage-data
 ---
 apiVersion: v1
 kind: Service
