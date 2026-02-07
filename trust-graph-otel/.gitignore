@@ -2,6 +2,7 @@
 *.kubeconfig
 kubeconfig
 .claude/
+scripts/.claude
 
 # Kind
 kind-config.yaml.local
